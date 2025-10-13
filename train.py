@@ -1,65 +1,15 @@
 import torch
-import chess
 import numpy as np
 from tqdm import tqdm
-from model import ChessNet, encode_board
-
-# Define move_to_index function here
-def move_to_index(move):
-    """Convert chess move to policy index."""
-    from_square = move.from_square
-    to_square = move.to_square
-    
-    # Calculate direction
-    from_rank = from_square // 8
-    from_file = from_square % 8
-    to_rank = to_square // 8
-    to_file = to_square % 8
-    
-    rank_diff = to_rank - from_rank
-    file_diff = to_file - from_file
-    
-    # Handle knight moves
-    knight_moves = [
-        (-2, -1), (-2, 1), (-1, -2), (-1, 2),
-        (1, -2), (1, 2), (2, -1), (2, 1)
-    ]
-    if (rank_diff, file_diff) in knight_moves:
-        move_type = 8 + knight_moves.index((rank_diff, file_diff))
-        return from_square * 19 + move_type
-    
-    # Handle queen moves (including rook and bishop moves)
-    queen_moves = [
-        (-1, -1), (-1, 0), (-1, 1),
-        (0, -1),          (0, 1),
-        (1, -1),  (1, 0),  (1, 1)
-    ]
-    
-    # Normalize direction for queen moves
-    if rank_diff != 0:
-        rank_diff = rank_diff // abs(rank_diff)
-    if file_diff != 0:
-        file_diff = file_diff // abs(file_diff)
-        
-    if (rank_diff, file_diff) in queen_moves:
-        move_type = queen_moves.index((rank_diff, file_diff))
-        return from_square * 19 + move_type
-    
-    # Handle promotions (other than queen)
-    if move.promotion and move.promotion != chess.QUEEN:
-        promo_pieces = [chess.KNIGHT, chess.BISHOP, chess.ROOK]
-        if move.promotion in promo_pieces:
-            move_type = 16 + promo_pieces.index(move.promotion)
-            return from_square * 19 + move_type
-            
-    # If we get here, something went wrong
-    return 0  # Safe default
-
-from mcts import MCTS
-import random
 from torch.utils.data import Dataset, DataLoader
+import time
+import random
 
-class ChessDataset(Dataset):
+from model import TicTacToeNet
+from game import TicTacToe
+from mcts import MCTS
+
+class TicTacToeDataset(Dataset):
     def __init__(self, states, policies, values):
         self.states = states
         self.policies = policies
@@ -71,45 +21,51 @@ class ChessDataset(Dataset):
     def __getitem__(self, idx):
         return self.states[idx], self.policies[idx], self.values[idx]
 
-def self_play_game(model, mcts, device):
+def self_play_game(model, game, mcts, device, max_moves=9):
     """Play a single game and return training data."""
-    board = chess.Board()
+    state = game.get_initial_state()
     states, policies, values = [], [], []
+    move_count = 0
+    current_player = 1
     
-    while not board.is_game_over():
+    while not game.get_value_and_terminated(state, None)[1] and move_count < max_moves:
         # Get current state
-        state_tensor = encode_board(board).to(device)
-        states.append(state_tensor)
+        encoded_state = game.get_encoded_state(state).to(device)
+        states.append(encoded_state.cpu())
         
         # Get MCTS policy
-        policy = mcts.search(board)
-        policies.append(policy)
+        policy = mcts.search(state)
+        policies.append(policy.cpu())
         
-        # Select move
-        if len(board.move_stack) < 30:  # Temperature = 1
-            probs = policy.numpy()
-            move_idx = np.random.choice(len(probs), p=probs)
+        # Select move with temperature
+        if move_count < 6:  # Temperature = 1 for first 6 moves
+            # Apply legal move mask
+            valid_moves = game.get_valid_moves(state)
+            masked_policy = policy * valid_moves
+            masked_policy = masked_policy / masked_policy.sum()
+            
+            probs = masked_policy.cpu().numpy()
+            action = np.random.choice(len(probs), p=probs)
         else:  # Temperature = 0
-            move_idx = policy.argmax().item()
+            # Apply legal move mask and select best move
+            valid_moves = game.get_valid_moves(state)
+            masked_policy = policy * valid_moves
+            action = masked_policy.argmax().item()
         
-        # Convert move index back to chess move
-        for move in board.legal_moves:
-            if move_to_index(move) == move_idx:
-                board.push(move)
-                break
+        # Make the move
+        state = game.get_next_state(state, action, current_player)
+        current_player = game.get_opponent(current_player)
+        move_count += 1
     
     # Get game result
-    outcome = board.outcome()
-    if outcome is None:
-        game_value = 0
-    else:
-        game_value = 1 if outcome.winner else -1
+    game_value, _ = game.get_value_and_terminated(state, None)
     
-    # Assign values to all states
+    # Assign values to all states (from the perspective of the player to move)
     current_value = game_value
-    for _ in range(len(states)):
+    for i in range(len(states)):
+        # Value flips for each player
         values.append(current_value)
-        current_value = -current_value  # Value flips between positions
+        current_value = -current_value
         
     return states, policies, values
 
@@ -146,15 +102,58 @@ def train_epoch(model, optimizer, dataloader, device):
     
     return total_loss / num_batches, policy_loss_total / num_batches, value_loss_total / num_batches
 
-def train_model(num_iterations=50, games_per_iteration=100, num_epochs=10, batch_size=32):
+def evaluate_model(model, game, device, num_games=10):
+    """Evaluate the model by playing against random moves."""
+    model.eval()
+    wins = 0
+    losses = 0
+    draws = 0
+    
+    for game_num in range(num_games):
+        state = game.get_initial_state()
+        mcts = MCTS(model, game, num_simulations=50, device=device)
+        current_player = 1
+        
+        while not game.get_value_and_terminated(state, None)[1]:
+            if current_player == 1:
+                # Model plays
+                policy = mcts.search(state)
+                valid_moves = game.get_valid_moves(state)
+                masked_policy = policy * valid_moves
+                action = masked_policy.argmax().item()
+            else:
+                # Random plays
+                valid_moves = game.get_valid_moves(state)
+                valid_actions = np.where(valid_moves == 1)[0]
+                if len(valid_actions) > 0:
+                    action = np.random.choice(valid_actions)
+                else:
+                    break  # No valid moves, game should be over
+            
+            state = game.get_next_state(state, action, current_player)
+            current_player = game.get_opponent(current_player)
+        
+        # Evaluate result
+        game_value, _ = game.get_value_and_terminated(state, None)
+        if game_value == 1:  # Model won
+            wins += 1
+        elif game_value == -1:  # Random won
+            losses += 1
+        else:  # Draw
+            draws += 1
+    
+    return wins, losses, draws
+
+def train_model(num_iterations=5, games_per_iteration=100, num_epochs=5, batch_size=64, num_simulations=50):
     """Main training loop."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Initialize model
-    model = ChessNet().to(device)
+    # Initialize game and model
+    game = TicTacToe()
+    model = TicTacToeNet().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-    mcts = MCTS(model, num_simulations=800, device=device)
+    mcts = MCTS(model, game, num_simulations=num_simulations, device=device)
     
     for iteration in range(num_iterations):
         print(f"\nIteration {iteration + 1}/{num_iterations}")
@@ -165,19 +164,24 @@ def train_model(num_iterations=50, games_per_iteration=100, num_epochs=10, batch
         all_values = []
         
         print("Generating self-play games...")
-        for game in tqdm(range(games_per_iteration)):
-            states, policies, values = self_play_game(model, mcts, device)
+        start_time = time.time()
+        
+        for game_num in tqdm(range(games_per_iteration)):
+            states, policies, values = self_play_game(model, game, mcts, device)
             all_states.extend(states)
             all_policies.extend(policies)
             all_values.extend(values)
         
+        elapsed = time.time() - start_time
+        print(f"Self-play completed in {elapsed:.1f} seconds. Collected {len(all_states)} positions.")
+        
         # Convert to tensors
         states_tensor = torch.stack(all_states)
-        policies_tensor = torch.stack([torch.tensor(p) for p in all_policies])
-        values_tensor = torch.tensor(all_values)
+        policies_tensor = torch.stack(all_policies)
+        values_tensor = torch.tensor(all_values, dtype=torch.float32)
         
         # Create dataset and dataloader
-        dataset = ChessDataset(states_tensor, policies_tensor, values_tensor)
+        dataset = TicTacToeDataset(states_tensor, policies_tensor, values_tensor)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         
         # Training phase
@@ -188,12 +192,21 @@ def train_model(num_iterations=50, games_per_iteration=100, num_epochs=10, batch
                   f"Loss: {total_loss:.4f} "
                   f"(Policy: {policy_loss:.4f}, Value: {value_loss:.4f})")
         
+        # Evaluate model
+        print("Evaluating model...")
+        wins, losses, draws = evaluate_model(model, game, device)
+        print(f"Evaluation: {wins} wins, {losses} losses, {draws} draws")
+        print(f"Win rate: {wins/(wins+losses+draws)*100:.1f}%")
+        
         # Save model checkpoint
         torch.save({
             'iteration': iteration + 1,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-        }, f'model_checkpoint_{iteration + 1}.pt')
+            'wins': wins,
+            'losses': losses,
+            'draws': draws,
+        }, f'tictactoe_checkpoint_{iteration + 1}.pt')
         
         print(f"Saved model checkpoint {iteration + 1}")
 

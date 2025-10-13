@@ -1,51 +1,116 @@
 import torch
-import chess
-from model import ChessNet, encode_board
+import numpy as np
+from model import TicTacToeNet
+from game import TicTacToe
 from mcts import MCTS
-from move_encoding import index_to_move, get_legal_move_mask
 
 def demo_model():
-    """Demonstrate the AlphaZero chess model."""
+    """Demonstrate the AlphaZero Tic-Tac-Toe model."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Initialize model
-    model = ChessNet().to(device)
+    # Initialize model and game
+    model = TicTacToeNet().to(device)
     model.eval()
     
-    # Initialize MCTS
-    mcts = MCTS(model, num_simulations=100, device=device)
+    game = TicTacToe()
+    mcts = MCTS(model, game, num_simulations=50, device=device)
     
     # Start a game
-    board = chess.Board()
+    state = game.get_initial_state()
     print("Starting position:")
-    print(board)
+    game.display(state)
     print()
     
     move_count = 0
-    while not board.is_game_over() and move_count < 10:  # Limit to 10 moves for demo
-        print(f"Move {move_count + 1}: {'White' if board.turn == chess.WHITE else 'Black'} to move")
+    current_player = 1
+    
+    while not game.get_value_and_terminated(state, None)[1] and move_count < 9:
+        print(f"Move {move_count + 1}: {'X' if current_player == 1 else 'O'} to move")
         
         # Get model's move
-        policy = mcts.search(board)
-        legal_mask = get_legal_move_mask(board)
-        masked_policy = policy * legal_mask
-        move_idx = masked_policy.argmax().item()
-        move = index_to_move(move_idx, board)
+        policy = mcts.search(state)
+        valid_moves = game.get_valid_moves(state)
+        masked_policy = policy * valid_moves
+        action = masked_policy.argmax().item()
         
-        if move is None or move not in board.legal_moves:
-            print("Model couldn't find a valid move, picking random move")
-            import random
-            move = random.choice(list(board.legal_moves))
+        row, col = action // 3, action % 3
+        print(f"Model plays: {action} (row {row}, col {col})")
         
-        print(f"Model plays: {move}")
-        board.push(move)
-        print(board)
-        print()
+        # Show move probabilities
+        print("Move probabilities:")
+        for i in range(9):
+            row_i, col_i = i // 3, i % 3
+            prob = policy[i].item()
+            if valid_moves[i] == 1:
+                print(f"  {row_i},{col_i}: {prob:.3f}")
         
+        state = game.get_next_state(state, action, current_player)
+        current_player = game.get_opponent(current_player)
         move_count += 1
+        
+        game.display(state)
+        print()
+    
+    # Determine result
+    game_value, _ = game.get_value_and_terminated(state, None)
+    if game_value == 1:
+        print("X wins!")
+    elif game_value == -1:
+        print("O wins!")
+    else:
+        print("It's a draw!")
+    
+    print("Demo completed!")
+
+def demo_training_progress():
+    """Demonstrate how the model improves during training."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    game = TicTacToe()
+    
+    # Test untrained model
+    print("Testing untrained model...")
+    model = TicTacToeNet().to(device)
+    model.eval()
+    
+    mcts = MCTS(model, game, num_simulations=50, device=device)
+    state = game.get_initial_state()
+    
+    print("Untrained model's move probabilities:")
+    policy = mcts.search(state)
+    for i in range(9):
+        row, col = i // 3, i % 3
+        prob = policy[i].item()
+        print(f"  {row},{col}: {prob:.3f}")
+    
+    print("\nUntrained model plays:")
+    game.display(state)
+    
+    # Simulate a few moves
+    for move in range(3):
+        valid_moves = game.get_valid_moves(state)
+        masked_policy = policy * valid_moves
+        action = masked_policy.argmax().item()
+        
+        row, col = action // 3, action % 3
+        print(f"Move {move + 1}: {action} (row {row}, col {col})")
+        
+        state = game.get_next_state(state, action, 1)
+        game.display(state)
+        
+        if game.get_value_and_terminated(state, None)[1]:
+            break
+        
+        # Get next policy
+        policy = mcts.search(state)
     
     print("Demo completed!")
 
 if __name__ == '__main__':
-    demo_model()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == 'training':
+        demo_training_progress()
+    else:
+        demo_model()

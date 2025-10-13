@@ -1,9 +1,68 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import chess
 import numpy as np
 
+class ResBlock(nn.Module):
+    def __init__(self, channels):
+        super(ResBlock, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        identity = x
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.bn2(self.conv2(x))
+        x += identity
+        x = F.relu(x)
+        return x
+
+class TicTacToeNet(nn.Module):
+    def __init__(self):
+        super(TicTacToeNet, self).__init__()
+        
+        # Input: 3x3x3 (much simpler than chess)
+        self.conv1 = nn.Conv2d(3, 64, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(64)
+        
+        # Residual blocks (fewer than chess)
+        self.res_blocks = nn.ModuleList([ResBlock(64) for _ in range(4)])
+        
+        # Policy head
+        self.policy_conv = nn.Conv2d(64, 32, 3, padding=1)
+        self.policy_bn = nn.BatchNorm2d(32)
+        self.policy_fc = nn.Linear(32 * 3 * 3, 9)  # 9 possible moves
+        
+        # Value head
+        self.value_conv = nn.Conv2d(64, 1, 1)
+        self.value_bn = nn.BatchNorm2d(1)
+        self.value_fc1 = nn.Linear(3 * 3, 64)
+        self.value_fc2 = nn.Linear(64, 1)
+
+    def forward(self, x):
+        # Initial convolution block
+        x = F.relu(self.bn1(self.conv1(x)))
+        
+        # Residual tower
+        for block in self.res_blocks:
+            x = block(x)
+        
+        # Policy head
+        policy = F.relu(self.policy_bn(self.policy_conv(x)))
+        policy = policy.view(-1, 32 * 3 * 3)
+        policy = self.policy_fc(policy)
+        
+        # Value head
+        value = F.relu(self.value_bn(self.value_conv(x)))
+        value = value.view(-1, 3 * 3)
+        value = F.relu(self.value_fc1(value))
+        value = torch.tanh(self.value_fc2(value))
+        
+        return policy, value
+
+# Keep the old ChessNet for backward compatibility
 class ChessNet(nn.Module):
     def __init__(self):
         super(ChessNet, self).__init__()
@@ -47,24 +106,9 @@ class ChessNet(nn.Module):
         
         return policy, value
 
-class ResBlock(nn.Module):
-    def __init__(self, channels):
-        super(ResBlock, self).__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(channels)
-
-    def forward(self, x):
-        identity = x
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = self.bn2(self.conv2(x))
-        x += identity
-        x = F.relu(x)
-        return x
-
 def encode_board(board):
     """Convert chess board to input tensor with 19 channels."""
+    import chess
     piece_chars = 'pnbrqkPNBRQK'
     piece_map = {piece: i for i, piece in enumerate(piece_chars)}
     
