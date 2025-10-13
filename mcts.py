@@ -3,56 +3,8 @@ import torch
 import chess
 import numpy as np
 from model import encode_board
+from move_encoding import move_to_index, index_to_move, get_legal_move_mask
 
-def move_to_index(move):
-    """Convert chess move to policy index."""
-    from_square = move.from_square
-    to_square = move.to_square
-    
-    # Calculate direction
-    from_rank = from_square // 8
-    from_file = from_square % 8
-    to_rank = to_square // 8
-    to_file = to_square % 8
-    
-    rank_diff = to_rank - from_rank
-    file_diff = to_file - from_file
-    
-    # Handle knight moves
-    knight_moves = [
-        (-2, -1), (-2, 1), (-1, -2), (-1, 2),
-        (1, -2), (1, 2), (2, -1), (2, 1)
-    ]
-    if (rank_diff, file_diff) in knight_moves:
-        move_type = 8 + knight_moves.index((rank_diff, file_diff))
-        return from_square * 19 + move_type
-    
-    # Handle queen moves (including rook and bishop moves)
-    queen_moves = [
-        (-1, -1), (-1, 0), (-1, 1),
-        (0, -1),          (0, 1),
-        (1, -1),  (1, 0),  (1, 1)
-    ]
-    
-    # Normalize direction for queen moves
-    if rank_diff != 0:
-        rank_diff = rank_diff // abs(rank_diff)
-    if file_diff != 0:
-        file_diff = file_diff // abs(file_diff)
-        
-    if (rank_diff, file_diff) in queen_moves:
-        move_type = queen_moves.index((rank_diff, file_diff))
-        return from_square * 19 + move_type
-    
-    # Handle promotions (other than queen)
-    if move.promotion and move.promotion != chess.QUEEN:
-        promo_pieces = [chess.KNIGHT, chess.BISHOP, chess.ROOK]
-        if move.promotion in promo_pieces:
-            move_type = 16 + promo_pieces.index(move.promotion)
-            return from_square * 19 + move_type
-            
-    # If we get here, something went wrong
-    return 0  # Safe default
 
 class Node:
     def __init__(self, prior=0.0):
@@ -72,19 +24,27 @@ class Node:
         """Expand node with new state and policy."""
         self.state = state
         self.to_play = to_play
-        policy_sum = 1e-8
+        
+        # Get legal move mask
+        legal_mask = get_legal_move_mask(state)
+        
+        # Mask the policy to only include legal moves
+        masked_policy = policy * legal_mask
+        
+        # Normalize the masked policy
+        policy_sum = masked_policy.sum()
+        if policy_sum > 0:
+            masked_policy = masked_policy / policy_sum
+        else:
+            # If all probabilities are zero, use uniform distribution over legal moves
+            masked_policy = legal_mask / legal_mask.sum()
         
         # Add children for each legal move
         for move in state.legal_moves:
             move_idx = move_to_index(move)
             if 0 <= move_idx < 1968:  # Valid move index
-                prob = policy[move_idx].item()
-                policy_sum += prob
+                prob = masked_policy[move_idx].item()
                 self.children[move] = Node(prior=prob)
-
-        # Normalize probabilities
-        for move in self.children:
-            self.children[move].prior /= policy_sum
 
     def select_child(self):
         """Select child node using PUCT algorithm."""
@@ -153,11 +113,12 @@ class MCTS:
                 # Game is over, use actual outcome
                 outcome = current_state.outcome()
                 if outcome is None:
-                    value = 0
+                    value = 0  # Draw
+                elif outcome.winner is None:
+                    value = 0  # Draw
                 else:
-                    value = 1 if outcome.winner else -1
-                    if not current_state.turn:
-                        value = -value
+                    # Winner is from the perspective of the player who just moved
+                    value = 1 if outcome.winner == current_state.turn else -1
             
             # Backpropagation
             for node in reversed(search_path):

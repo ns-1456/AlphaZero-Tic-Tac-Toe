@@ -8,8 +8,8 @@ class ChessNet(nn.Module):
     def __init__(self):
         super(ChessNet, self).__init__()
         
-        # Input: 8x8x12 (6 piece types x 2 colors)
-        self.conv1 = nn.Conv2d(12, 256, 3, padding=1)
+        # Input: 8x8x19 (12 piece types + 7 auxiliary channels)
+        self.conv1 = nn.Conv2d(19, 256, 3, padding=1)
         self.bn1 = nn.BatchNorm2d(256)
         
         # Residual blocks
@@ -64,14 +64,14 @@ class ResBlock(nn.Module):
         return x
 
 def encode_board(board):
-    """Convert chess board to input tensor."""
+    """Convert chess board to input tensor with 19 channels."""
     piece_chars = 'pnbrqkPNBRQK'
     piece_map = {piece: i for i, piece in enumerate(piece_chars)}
     
-    # Initialize 12 planes of 8x8
-    planes = torch.zeros(12, 8, 8)
+    # Initialize 19 planes of 8x8
+    planes = torch.zeros(19, 8, 8)
     
-    # Fill in piece positions
+    # Fill in piece positions (12 channels)
     for square in chess.SQUARES:
         piece = board.piece_at(square)
         if piece:
@@ -79,5 +79,21 @@ def encode_board(board):
             file = square % 8
             piece_idx = piece_map[piece.symbol()]
             planes[piece_idx][rank][file] = 1
-            
+    
+    # Castling rights (4 channels)
+    planes[12][0][0] = float(board.has_kingside_castling_rights(chess.WHITE))
+    planes[13][0][0] = float(board.has_queenside_castling_rights(chess.WHITE))
+    planes[14][0][0] = float(board.has_kingside_castling_rights(chess.BLACK))
+    planes[15][0][0] = float(board.has_queenside_castling_rights(chess.BLACK))
+    
+    # Side to move (1 channel)
+    if board.turn == chess.WHITE:
+        planes[16].fill_(1)
+    
+    # Move count (1 channel)
+    planes[17].fill_(min(board.fullmove_number / 50.0, 1.0))
+    
+    # No-progress count (1 channel)
+    planes[18].fill_(min(board.halfmove_clock / 100.0, 1.0))
+    
     return planes
